@@ -2,9 +2,13 @@
 
 // Platform-specific only
 #define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <Windows.h>
-#include <dxgi1_2.h>
+#include <dxgi1_6.h>
 #include <d2d1_1.h>
+#include <DirectXPackedVector.h>
 #include <atlbase.h>
 #include <comdef.h>
 
@@ -15,12 +19,99 @@
 
 #include <utils/Logger.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
+#include <iterator>
+#include <string>
+#include <vector>
 
 // Constants
 namespace {
 	constexpr std::chrono::milliseconds RETRY_INTERVAL{ 2000 };
+
+	// HDR handling
+	// scRGB (FP16) desktop: a value of 1.0 equals 80 nits
+	constexpr float SCRGB_REFERENCE_NITS = 80.0F;
+	// Used, if the Windows "SDR content brightness" cannot be queried
+	constexpr float DEFAULT_SDR_WHITE_NITS = 200.0F;
+	// Re-read the SDR white level periodically, as the user can change it at any time
+	constexpr std::chrono::milliseconds SDR_WHITE_LEVEL_REFRESH_INTERVAL{ 5000 };
+	// Resolution of the linear -> sRGB lookup table
+	constexpr int SRGB_LUT_SIZE = 16384;
+
+	///
+	/// @brief Query the Windows "SDR content brightness" (SDR white level) of an HDR display.
+	///
+	/// @param[in] gdiDeviceName GDI device name of the output, e.g. "\\.\DISPLAY1"
+	/// @param[in] fallbackNits  Value returned, if the level cannot be determined
+	/// @return SDR white level in nits
+	///
+	float querySdrWhiteLevelNits(const std::wstring& gdiDeviceName, float fallbackNits)
+	{
+		UINT32 pathCount = 0;
+		UINT32 modeCount = 0;
+		if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS)
+		{
+			return fallbackNits;
+		}
+
+		std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+		std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+		if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(), &modeCount, modes.data(), nullptr) != ERROR_SUCCESS)
+		{
+			return fallbackNits;
+		}
+		paths.resize(pathCount);
+
+		for (const auto& path : paths)
+		{
+			DISPLAYCONFIG_SOURCE_DEVICE_NAME sourceName{};
+			sourceName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+			sourceName.header.size = sizeof(sourceName);
+			sourceName.header.adapterId = path.sourceInfo.adapterId;
+			sourceName.header.id = path.sourceInfo.id;
+			if (DisplayConfigGetDeviceInfo(&sourceName.header) != ERROR_SUCCESS)
+			{
+				continue;
+			}
+
+			if (gdiDeviceName != sourceName.viewGdiDeviceName)
+			{
+				continue;
+			}
+
+			DISPLAYCONFIG_SDR_WHITE_LEVEL whiteLevel{};
+			whiteLevel.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+			whiteLevel.header.size = sizeof(whiteLevel);
+			whiteLevel.header.adapterId = path.targetInfo.adapterId;
+			whiteLevel.header.id = path.targetInfo.id;
+			if (DisplayConfigGetDeviceInfo(&whiteLevel.header) == ERROR_SUCCESS && whiteLevel.SDRWhiteLevel > 0)
+			{
+				// SDRWhiteLevel is a multiplier of 80 nits, scaled by 1000
+				return static_cast<float>(whiteLevel.SDRWhiteLevel) / 1000.0F * SCRGB_REFERENCE_NITS;
+			}
+		}
+		return fallbackNits;
+	}
+
+	///
+	/// @brief Build a lookup table mapping linear light [0..1] to 8-bit sRGB
+	///
+	std::vector<uint8_t> buildLinearToSrgbLut()
+	{
+		std::vector<uint8_t> lut(SRGB_LUT_SIZE + 1);
+		for (int i = 0; i <= SRGB_LUT_SIZE; ++i)
+		{
+			const double linear = static_cast<double>(i) / SRGB_LUT_SIZE;
+			const double srgb = (linear <= 0.0031308)
+				? linear * 12.92
+				: 1.055 * std::pow(linear, 1.0 / 2.4) - 0.055;
+			lut[i] = static_cast<uint8_t>(std::lround(std::clamp(srgb, 0.0, 1.0) * 255.0));
+		}
+		return lut;
+	}
 } //End of constants
 
 // Logs a message along with the hex error HRESULT.
@@ -94,6 +185,18 @@ public:
 
 	// Retry timer for reinitializing duplication when unavailable/access denied
 	QElapsedTimer lastRetryTimer;
+
+	// HDR handling
+	std::wstring gdiDeviceName;                                  // e.g. "\\.\DISPLAY1"
+	bool isHdr = false;                                          // Output is in HDR (PQ / BT.2020) mode
+	float sdrWhiteNits = DEFAULT_SDR_WHITE_NITS;                 // Windows "SDR content brightness"
+	QElapsedTimer sdrWhiteLevelTimer;
+	DXGI_FORMAT pipelineFormat = DXGI_FORMAT_B8G8R8A8_UNORM;     // Format of the D2D target / staging textures
+	std::vector<uint8_t> linearToSrgbLut;
+
+	// Fallback, if D2D cannot read the duplicated texture directly (e.g. not bindable as shader resource)
+	CComPtr<ID3D11Texture2D> sourceCopyTexture;
+	bool useSourceCopy = false;
 };
 
 DDAGrabber::DDAGrabber(int display, int cropLeft, int cropRight, int cropTop, int cropBottom)
@@ -105,6 +208,8 @@ DDAGrabber::DDAGrabber(int display, int cropLeft, int cropRight, int cropTop, in
 	d->display = display;
 	// Initialize retry timer
 	d->lastRetryTimer.start();
+	d->sdrWhiteLevelTimer.start();
+	d->linearToSrgbLut = buildLinearToSrgbLut();
 }
 
 DDAGrabber::~DDAGrabber()
@@ -269,6 +374,54 @@ bool DDAGrabber::restartCapture()
 
 	d->desktopWidth = desc.DesktopCoordinates.right - desc.DesktopCoordinates.left;
 	d->desktopHeight = desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top;
+	d->gdiDeviceName = desc.DeviceName;
+
+	// Detect, if the output runs in HDR mode (Windows "Use HDR" enabled)
+	d->isHdr = false;
+	{
+		CComPtr<IDXGIOutput6> output6;
+		if (SUCCEEDED(output->QueryInterface(&output6)))
+		{
+			DXGI_OUTPUT_DESC1 desc1{};
+			if (SUCCEEDED(output6->GetDesc1(&desc1)))
+			{
+				d->isHdr = (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+			}
+		}
+	}
+	if (d->isHdr)
+	{
+		d->sdrWhiteNits = querySdrWhiteLevelNits(d->gdiDeviceName, DEFAULT_SDR_WHITE_NITS);
+		d->sdrWhiteLevelTimer.restart();
+		Info(_log, "Display %d is in HDR mode. Capturing in FP16 (scRGB), SDR white level: %.0f nits", d->display, d->sdrWhiteNits);
+	}
+
+	// Creates the desktop duplication.
+	// In HDR mode the frames are requested as FP16 scRGB, so that they are always delivered in one consistent,
+	// linear format. The legacy DuplicateOutput lets Windows convert HDR to 8-bit, which is not consistent
+	// for all frames (e.g. partial updates from non-focused windows result in heavily dimmed frames).
+	bool isFp16Duplication = false;
+	auto duplicateOutput = [this, &isFp16Duplication]() -> HRESULT
+	{
+		isFp16Duplication = false;
+		if (d->isHdr)
+		{
+			CComPtr<IDXGIOutput5> output5;
+			if (SUCCEEDED(d->dxgiOutput1->QueryInterface(&output5)))
+			{
+				const DXGI_FORMAT supportedFormats[] = { DXGI_FORMAT_R16G16B16A16_FLOAT };
+				HRESULT hrFp16 = output5->DuplicateOutput1(d->device, 0, static_cast<UINT>(std::size(supportedFormats)), supportedFormats, &d->desktopDuplication);
+				if (SUCCEEDED(hrFp16))
+				{
+					isFp16Duplication = true;
+					return hrFp16;
+				}
+				Warning(_log, "DuplicateOutput1 (FP16) failed: 0x%x - falling back to legacy capture. HDR colors may be wrong.", hrFp16);
+				d->desktopDuplication.Release();
+			}
+		}
+		return d->dxgiOutput1->DuplicateOutput(d->device, &d->desktopDuplication);
+	};
 
 	if (_cropLeft + _cropRight >= d->desktopWidth || _cropTop + _cropBottom >= d->desktopHeight)
 	{
@@ -292,7 +445,7 @@ bool DDAGrabber::restartCapture()
 		d->desktopRotation = desc.Rotation;
 
 		// Recreate desktop duplication
-		hr = d->dxgiOutput1->DuplicateOutput(d->device, &d->desktopDuplication);
+		hr = duplicateOutput();
 		if (FAILED(hr))
 		{
 			LOG_ERROR(hr, "DuplicateOutput failed");
@@ -313,7 +466,7 @@ bool DDAGrabber::restartCapture()
 				RETURN_IF_ERROR(hr, "Failed to get output1 (retry)", false);
 				d->dxgiOutput1 = output1Retry;
 				// Retry DuplicateOutput
-				hr = d->dxgiOutput1->DuplicateOutput(d->device, &d->desktopDuplication);
+				hr = duplicateOutput();
 			}
 
 			if (hr == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE)
@@ -334,35 +487,11 @@ bool DDAGrabber::restartCapture()
 			RETURN_IF_ERROR(hr, "Failed to create desktop duplication interface", false);
 		}
 
-		// 1. Create the final GPU texture and staging texture.
-		qCDebug(grabber_screen_flow) << "Creating final-sized GPU resources [" << _width << "x" << _height << "]";
-		D3D11_TEXTURE2D_DESC finalDesc = {};
-		finalDesc.Width = _width;
-		finalDesc.Height = _height;
-		finalDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-		finalDesc.MipLevels = 1;
-		finalDesc.ArraySize = 1;
-		finalDesc.SampleDesc.Count = 1;
-		finalDesc.Usage = D3D11_USAGE_DEFAULT;
-		finalDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
-
-		d->d2dConvertedTexture.Release();
-		hr = d->device->CreateTexture2D(&finalDesc, nullptr, &d->d2dConvertedTexture);
-		RETURN_IF_ERROR(hr, "Failed to create final GPU texture", false);
-
-		// Recreate the CPU staging texture to match
-		finalDesc.Usage = D3D11_USAGE_STAGING;
-		finalDesc.BindFlags = 0;
-		finalDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-		d->intermediateTexture.Release();
-		hr = d->device->CreateTexture2D(&finalDesc, nullptr, &d->intermediateTexture);
-		RETURN_IF_ERROR(hr, "Failed to create final staging texture", false);
-
-		// 2. Pre-create the destination D2D bitmap
-		CComPtr<IDXGISurface> destSurface;
-		d->d2dConvertedTexture->QueryInterface(&destSurface);
-		d->destBitmap.Release();
-		d->d2dContext->CreateBitmapFromDxgiSurface(destSurface, nullptr, &d->destBitmap);
+		// 1. + 2. Create the final GPU texture, the staging texture and the destination D2D bitmap.
+		if (!createPipelineResources(isFp16Duplication ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM))
+		{
+			return false;
+		}
 
 		// Determine rotated dimensions for D3D
 		bool swapDimensions = d->desktopRotation == DXGI_MODE_ROTATION_ROTATE90 || d->desktopRotation == DXGI_MODE_ROTATION_ROTATE270;
@@ -421,6 +550,60 @@ bool DDAGrabber::restartCapture()
 		qCDebug(grabber_screen_flow) << "Reusing existing output for display" << d->display;
 	}
 
+	return true;
+}
+
+bool DDAGrabber::createPipelineResources(DXGI_FORMAT format)
+{
+	qCDebug(grabber_screen_flow) << "Creating final-sized GPU resources [" << _width << "x" << _height << "], format:" << static_cast<int>(format);
+
+	HRESULT hr{ S_OK };
+
+	D3D11_TEXTURE2D_DESC finalDesc = {};
+	finalDesc.Width = _width;
+	finalDesc.Height = _height;
+	finalDesc.Format = format;
+	finalDesc.MipLevels = 1;
+	finalDesc.ArraySize = 1;
+	finalDesc.SampleDesc.Count = 1;
+	finalDesc.Usage = D3D11_USAGE_DEFAULT;
+	finalDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+
+	d->d2dConvertedTexture.Release();
+	hr = d->device->CreateTexture2D(&finalDesc, nullptr, &d->d2dConvertedTexture);
+	RETURN_IF_ERROR(hr, "Failed to create final GPU texture", false);
+
+	// Recreate the CPU staging texture to match
+	finalDesc.Usage = D3D11_USAGE_STAGING;
+	finalDesc.BindFlags = 0;
+	finalDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	d->intermediateTexture.Release();
+	hr = d->device->CreateTexture2D(&finalDesc, nullptr, &d->intermediateTexture);
+	RETURN_IF_ERROR(hr, "Failed to create final staging texture", false);
+
+	// Pre-create the destination D2D bitmap
+	CComPtr<IDXGISurface> destSurface;
+	hr = d->d2dConvertedTexture->QueryInterface(&destSurface);
+	RETURN_IF_ERROR(hr, "Failed to get destination surface", false);
+	d->destBitmap.Release();
+	if (format == DXGI_FORMAT_B8G8R8A8_UNORM)
+	{
+		hr = d->d2dContext->CreateBitmapFromDxgiSurface(destSurface, nullptr, &d->destBitmap);
+	}
+	else
+	{
+		// FP16 target: D2D draws in linear light, the scRGB values are kept as they are (no clamping)
+		const D2D1_BITMAP_PROPERTIES1 targetProperties = D2D1::BitmapProperties1(
+			D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+			D2D1::PixelFormat(format, D2D1_ALPHA_MODE_PREMULTIPLIED));
+		hr = d->d2dContext->CreateBitmapFromDxgiSurface(destSurface, &targetProperties, &d->destBitmap);
+	}
+	RETURN_IF_ERROR(hr, "Failed to create destination bitmap", false);
+
+	d->pipelineFormat = format;
+	// Re-evaluate, if D2D can read the duplicated frames directly
+	d->sourceCopyTexture.Release();
+	d->useSourceCopy = false;
 	return true;
 }
 
@@ -587,18 +770,121 @@ int DDAGrabber::grabFrame(Image<ColorRgb>& image, bool /*forceUpdate*/)
 		RETURN_IF_ERROR(hr, "Failed to get 2D texture from resource", -1);
 	}
 
-	// Use the D2D pipeline to handle any transformation or format conversion.
-	CComPtr<IDXGISurface> sourceSurface;
-	sourceTexture->QueryInterface(&sourceSurface);
-	CComPtr<ID2D1Bitmap1> sourceBitmap;
-	d->d2dContext->CreateBitmapFromDxgiSurface(sourceSurface, nullptr, &sourceBitmap);
+	// Ensure the processing pipeline matches the format of the delivered frame
+	D3D11_TEXTURE2D_DESC sourceDesc{};
+	sourceTexture->GetDesc(&sourceDesc);
+	if (sourceDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM && sourceDesc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT)
+	{
+		qCDebug(grabber_screen_capture) << "Skipping frame with unsupported format" << static_cast<int>(sourceDesc.Format);
+		return -1;
+	}
+	if (sourceDesc.Format != d->pipelineFormat)
+	{
+		Debug(_log, "Frame format changed from %d to %d. Recreating processing pipeline.", static_cast<int>(d->pipelineFormat), static_cast<int>(sourceDesc.Format));
+		if (!createPipelineResources(sourceDesc.Format))
+		{
+			return -1;
+		}
+	}
 
-	// Draw to our B8G8R8A8 target, performing all transforms (using pre-calculated members)
+	const bool isFp16Frame = (sourceDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT);
+	if (isFp16Frame && d->sdrWhiteLevelTimer.hasExpired(SDR_WHITE_LEVEL_REFRESH_INTERVAL.count()))
+	{
+		const float sdrWhiteNits = querySdrWhiteLevelNits(d->gdiDeviceName, d->sdrWhiteNits);
+		if (std::abs(sdrWhiteNits - d->sdrWhiteNits) > 0.5F)
+		{
+			Info(_log, "SDR white level changed from %.0f to %.0f nits", d->sdrWhiteNits, sdrWhiteNits);
+			d->sdrWhiteNits = sdrWhiteNits;
+		}
+		d->sdrWhiteLevelTimer.restart();
+	}
+
+	// Use the D2D pipeline to handle any transformation or format conversion.
+	auto createSourceBitmap = [this, isFp16Frame](ID3D11Texture2D* texture, CComPtr<ID2D1Bitmap1>& bitmap) -> HRESULT
+	{
+		bitmap.Release();
+		CComPtr<IDXGISurface> surface;
+		HRESULT hrSurface = texture->QueryInterface(&surface);
+		if (FAILED(hrSurface))
+		{
+			return hrSurface;
+		}
+		if (isFp16Frame)
+		{
+			const D2D1_BITMAP_PROPERTIES1 sourceProperties = D2D1::BitmapProperties1(
+				D2D1_BITMAP_OPTIONS_NONE,
+				D2D1::PixelFormat(DXGI_FORMAT_R16G16B16A16_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED));
+			return d->d2dContext->CreateBitmapFromDxgiSurface(surface, &sourceProperties, &bitmap);
+		}
+		return d->d2dContext->CreateBitmapFromDxgiSurface(surface, nullptr, &bitmap);
+	};
+
+	// Copies the duplicated frame into an own texture, which D2D can always read
+	auto copySourceTexture = [this, &sourceDesc, &sourceTexture]() -> HRESULT
+	{
+		D3D11_TEXTURE2D_DESC copyDesc{};
+		if (d->sourceCopyTexture)
+		{
+			d->sourceCopyTexture->GetDesc(&copyDesc);
+		}
+		if (!d->sourceCopyTexture || copyDesc.Width != sourceDesc.Width || copyDesc.Height != sourceDesc.Height || copyDesc.Format != sourceDesc.Format)
+		{
+			copyDesc = {};
+			copyDesc.Width = sourceDesc.Width;
+			copyDesc.Height = sourceDesc.Height;
+			copyDesc.Format = sourceDesc.Format;
+			copyDesc.MipLevels = 1;
+			copyDesc.ArraySize = 1;
+			copyDesc.SampleDesc.Count = 1;
+			copyDesc.Usage = D3D11_USAGE_DEFAULT;
+			copyDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			d->sourceCopyTexture.Release();
+			HRESULT hrCreate = d->device->CreateTexture2D(&copyDesc, nullptr, &d->sourceCopyTexture);
+			if (FAILED(hrCreate))
+			{
+				return hrCreate;
+			}
+		}
+		d->deviceContext->CopyResource(d->sourceCopyTexture, sourceTexture);
+		return S_OK;
+	};
+
+	CComPtr<ID2D1Bitmap1> sourceBitmap;
+	if (!d->useSourceCopy)
+	{
+		hr = createSourceBitmap(sourceTexture, sourceBitmap);
+		if (FAILED(hr))
+		{
+			Debug(_log, "D2D cannot read the duplicated frame directly (0x%x). Using an intermediate copy.", hr);
+			d->useSourceCopy = true;
+		}
+	}
+	if (d->useSourceCopy)
+	{
+		hr = copySourceTexture();
+		if (SUCCEEDED(hr))
+		{
+			hr = createSourceBitmap(d->sourceCopyTexture, sourceBitmap);
+		}
+	}
+	if (FAILED(hr) || sourceBitmap == nullptr)
+	{
+		Error(_log, "Failed to create source bitmap (format %d): 0x%x", static_cast<int>(sourceDesc.Format), static_cast<unsigned>(hr));
+		return -1;
+	}
+
+	// Draw to our target (B8G8R8A8 or FP16), performing all transforms (using pre-calculated members)
 	d->d2dContext->SetTarget(d->destBitmap);
 	d->d2dContext->BeginDraw();
 	d->d2dContext->SetTransform(d->orientationTransform);
+	if (isFp16Frame)
+	{
+		// Overwrite the target, independent of the alpha values delivered
+		d->d2dContext->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
+	}
 	d->d2dContext->DrawBitmap(sourceBitmap, d->destRect, 1.0f, D2D1_INTERPOLATION_MODE_LINEAR, d->sourceRect);
 	hr = d->d2dContext->EndDraw();
+	d->d2dContext->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
 	d->d2dContext->SetTarget(nullptr);
 
 	// Copy the D2D result to the staging texture
@@ -616,10 +902,62 @@ int DDAGrabber::grabFrame(Image<ColorRgb>& image, bool /*forceUpdate*/)
 	hr = d->deviceContext->Map(d->intermediateTexture, 0, D3D11_MAP_READ, 0, &mapped);
 	RETURN_IF_ERROR(hr, "Failed to map final texture", -1);
 
-	// CPU pixel copy from BGRA to output RGB image
 	ColorRgb* destPtr = image.memptr();
 	const auto* srcPtr = static_cast<const uint8_t*>(mapped.pData);
 
+	if (isFp16Frame)
+	{
+		// CPU conversion from FP16 scRGB (linear, 1.0 = 80 nits) to 8-bit sRGB.
+		// SDR content is mapped to full range using the Windows SDR white level,
+		// brighter HDR highlights are scaled down preserving the hue.
+		const float scale = SCRGB_REFERENCE_NITS / std::max(d->sdrWhiteNits, 1.0F);
+		const uint8_t* lut = d->linearToSrgbLut.data();
+		// Half -> linear value relative to SDR white. Negative (out of sRGB gamut), NaN and Inf values become 0.
+		auto toLinear = [scale](DirectX::PackedVector::HALF value) -> float
+		{
+			const float linear = DirectX::PackedVector::XMConvertHalfToFloat(value) * scale;
+			return (std::isfinite(linear) && linear > 0.0F) ? linear : 0.0F;
+		};
+		// Linear [0..1] -> 8-bit sRGB
+		auto toSrgb = [lut](float linear) -> uint8_t
+		{
+			return lut[static_cast<int>(linear * SRGB_LUT_SIZE + 0.5F)];
+		};
+
+		for (int y = 0; y < _height; ++y)
+		{
+			const auto* srcRowPtr = static_cast<const DirectX::PackedVector::HALF*>(static_cast<const void*>(srcPtr + y * mapped.RowPitch));
+			ColorRgb* destRowPtr = destPtr + y * _width;
+
+			for (int x = 0; x < _width; ++x)
+			{
+				float red = toLinear(srcRowPtr[0]);
+				float green = toLinear(srcRowPtr[1]);
+				float blue = toLinear(srcRowPtr[2]);
+
+				const float maxChannel = std::max({ red, green, blue });
+				if (maxChannel > 1.0F)
+				{
+					red /= maxChannel;
+					green /= maxChannel;
+					blue /= maxChannel;
+				}
+
+				destRowPtr->red = toSrgb(std::min(red, 1.0F));
+				destRowPtr->green = toSrgb(std::min(green, 1.0F));
+				destRowPtr->blue = toSrgb(std::min(blue, 1.0F));
+
+				// Move to the next pixel (RGBA)
+				srcRowPtr += 4;
+				destRowPtr++;
+			}
+		}
+
+		d->deviceContext->Unmap(d->intermediateTexture, 0);
+		return 0;
+	}
+
+	// CPU pixel copy from BGRA to output RGB image
 	for (int y = 0; y < _height; ++y)
 	{
 		// Set pointers to the start of the current row

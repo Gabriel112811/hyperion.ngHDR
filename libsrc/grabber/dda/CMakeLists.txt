@@ -10,4 +10,5 @@ target_link_libraries(dda-grabber
 	d3d11.lib
 	dxgi.lib
 	d2d1.lib
+	user32.lib
 )

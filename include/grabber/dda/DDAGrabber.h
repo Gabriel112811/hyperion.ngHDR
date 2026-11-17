@@ -62,6 +62,13 @@ private:
 	bool restartCapture();
 
 	///
+	/// @brief (Re-)create the GPU target/staging textures and the D2D target bitmap for the given pixel format
+	/// @param[in] format DXGI_FORMAT_B8G8R8A8_UNORM (SDR) or DXGI_FORMAT_R16G16B16A16_FLOAT (HDR, scRGB)
+	/// @return True on success
+	///
+	bool createPipelineResources(DXGI_FORMAT format);
+
+	///
 	/// Validates the cursor settings and report,
 	/// if a setting results in that the mouse cursor is part of the capture.
 	///
